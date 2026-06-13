@@ -59,32 +59,43 @@ func (p *Pool) OpenVolume(name string) (*Volume, error) {
 // snapshot is read-only and immutable: its blocks are reference-counted, so
 // later writes to the live volume copy-on-write rather than disturb it.
 func (p *Pool) Snapshot(src, snap string) (*Volume, error) {
+	return p.branch(src, snap, true)
+}
+
+// Clone creates a new *writable* volume that shares src's blocks copy-on-write
+// (an instant, space-shared branch — ZFS-style). Writes to the clone or to src
+// diverge independently. src is typically a snapshot, but any volume works.
+func (p *Pool) Clone(src, clone string) (*Volume, error) {
+	return p.branch(src, clone, false)
+}
+
+// branch implements Snapshot (readOnly) and Clone (writable): copy src's block
+// map and share its blocks via refcounts.
+func (p *Pool) branch(src, name string, readOnly bool) (*Volume, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s, ok := p.meta.Volumes[src]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if _, ok := p.meta.Volumes[snap]; ok {
+	if _, ok := p.meta.Volumes[name]; ok {
 		return nil, ErrExists
 	}
-	cp := &volSpec{Name: snap, Blocks: s.Blocks, Map: make([]int64, len(s.Map)), ReadOnly: true}
+	cp := &volSpec{Name: name, Blocks: s.Blocks, Map: make([]int64, len(s.Map)), ReadOnly: readOnly}
 	copy(cp.Map, s.Map)
-	// Every physical block the snapshot references is now shared.
 	for _, b := range cp.Map {
 		if b >= 0 {
 			p.meta.Refcount[b]++
 		}
 	}
-	p.meta.Volumes[snap] = cp
+	p.meta.Volumes[name] = cp
 	if err := p.sync(); err != nil {
-		// Roll back the refcount bumps and the new entry.
 		for _, b := range cp.Map {
 			if b >= 0 {
 				p.meta.Refcount[b]--
 			}
 		}
-		delete(p.meta.Volumes, snap)
+		delete(p.meta.Volumes, name)
 		return nil, err
 	}
 	return &Volume{p: p, spec: cp}, nil
