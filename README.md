@@ -40,6 +40,13 @@ driver** straight onto a pool volume, and it composes with
 Note: XFS historically had no free integrated volume manager (SGI's XLV/XVM were
 proprietary), so a CoW pool under XFS fills a real gap.
 
+**Verified end-to-end:** a real ext4 filesystem (the `go-filesystems/ext4`
+driver) was run live on a pool volume via `OpenFromDevice`, a file was written,
+the volume snapshotted, then the live file overwritten and a new file added.
+Read back through ext4, the **live** volume showed the new state while the
+**snapshot** showed the exact pre-snapshot filesystem — ext4 never knew it was
+on a CoW pool, and the snapshot was fully isolated.
+
 ## Usage
 
 ```go
