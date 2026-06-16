@@ -31,7 +31,7 @@ const (
 // every Sync (its offset/length live in the header).
 type Pool struct {
 	mu        sync.Mutex
-	f         *os.File
+	f         Backing
 	blockSize int64
 	dataStart int64  // byte offset of physical block 0
 	nblocks   uint32 // number of physical data blocks (capacity)
@@ -41,7 +41,7 @@ type Pool struct {
 
 // metadata is the gob-serialised pool state.
 type metadata struct {
-	Refcount []uint32           // one entry per physical block; 0 = free
+	Refcount []uint32            // one entry per physical block; 0 = free
 	Volumes  map[string]*volSpec // live volumes and snapshots
 }
 
@@ -61,19 +61,35 @@ func Create(path string, capacityBytes int64) (*Pool, error) {
 
 // CreateBlock is Create with an explicit block size (power of two ≥ 512).
 func CreateBlock(path string, capacityBytes, blockSize int64) (*Pool, error) {
-	if blockSize < 512 || blockSize&(blockSize-1) != 0 {
-		return nil, fmt.Errorf("pool: block size %d must be a power of two ≥ 512", blockSize)
-	}
-	n := capacityBytes / blockSize
-	if n <= 0 {
-		return nil, fmt.Errorf("pool: capacity %d too small for block size %d", capacityBytes, blockSize)
+	// Validate before touching the filesystem, so bad geometry never leaves a
+	// stray file behind.
+	if _, err := validateGeom(capacityBytes, blockSize); err != nil {
+		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("pool: create %s: %w", path, err)
 	}
+	p, err := CreateWith(f, capacityBytes, blockSize)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return p, nil
+}
+
+// CreateWith makes a new pool on an arbitrary [Backing] — a memory buffer, an
+// S3-backed chunk store, an NBD export — rather than a local file. The backing
+// is assumed empty; CreateWith reserves the data region on it. On success the
+// pool owns the backing and [Pool.Close] closes it; on error the caller keeps
+// ownership of b.
+func CreateWith(b Backing, capacityBytes, blockSize int64) (*Pool, error) {
+	n, err := validateGeom(capacityBytes, blockSize)
+	if err != nil {
+		return nil, err
+	}
 	p := &Pool{
-		f:         f,
+		f:         b,
 		blockSize: blockSize,
 		dataStart: blockSize,
 		nblocks:   uint32(n),
@@ -83,39 +99,58 @@ func CreateBlock(path string, capacityBytes, blockSize int64) (*Pool, error) {
 		},
 	}
 	// Reserve the data region.
-	if err := f.Truncate(p.dataStart + int64(n)*blockSize); err != nil {
-		f.Close()
+	if err := b.Truncate(p.dataStart + int64(n)*blockSize); err != nil {
 		return nil, fmt.Errorf("pool: truncate: %w", err)
 	}
 	if err := p.sync(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// validateGeom checks the pool geometry and returns the data-block count.
+func validateGeom(capacityBytes, blockSize int64) (int64, error) {
+	if blockSize < 512 || blockSize&(blockSize-1) != 0 {
+		return 0, fmt.Errorf("pool: block size %d must be a power of two ≥ 512", blockSize)
+	}
+	n := capacityBytes / blockSize
+	if n <= 0 {
+		return 0, fmt.Errorf("pool: capacity %d too small for block size %d", capacityBytes, blockSize)
+	}
+	return n, nil
+}
+
+// Open opens an existing file-backed pool.
+func Open(path string) (*Pool, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("pool: open %s: %w", path, err)
+	}
+	p, err := OpenWith(f)
+	if err != nil {
 		f.Close()
 		return nil, err
 	}
 	return p, nil
 }
 
-// Open opens an existing pool.
-func Open(path string) (*Pool, error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("pool: open %s: %w", path, err)
-	}
+// OpenWith opens an existing pool that lives on an arbitrary [Backing]. On
+// success the pool owns the backing and [Pool.Close] closes it; on error the
+// caller keeps ownership of b.
+func OpenWith(b Backing) (*Pool, error) {
 	hdr := make([]byte, headerSize)
-	if _, err := f.ReadAt(hdr, 0); err != nil {
-		f.Close()
+	if _, err := b.ReadAt(hdr, 0); err != nil {
 		return nil, fmt.Errorf("pool: read header: %w", err)
 	}
 	be := binary.BigEndian
 	if be.Uint64(hdr[0:]) != magic {
-		f.Close()
 		return nil, ErrBadMagic
 	}
 	if be.Uint32(hdr[8:]) != version {
-		f.Close()
 		return nil, ErrUnsupportedVersion
 	}
 	p := &Pool{
-		f:         f,
+		f:         b,
 		blockSize: int64(be.Uint32(hdr[12:])),
 		nblocks:   be.Uint32(hdr[16:]),
 	}
@@ -123,16 +158,13 @@ func Open(path string) (*Pool, error) {
 	metaOffset := int64(be.Uint64(hdr[24:]))
 	metaLen := int64(be.Uint64(hdr[32:]))
 	blob := make([]byte, metaLen)
-	if _, err := f.ReadAt(blob, metaOffset); err != nil {
-		f.Close()
+	if _, err := b.ReadAt(blob, metaOffset); err != nil {
 		return nil, fmt.Errorf("pool: read metadata: %w", err)
 	}
 	if err := gobDecode(blob, &p.meta); err != nil {
-		f.Close()
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	if uint32(len(p.meta.Refcount)) != p.nblocks {
-		f.Close()
 		return nil, fmt.Errorf("%w: refcount length %d != nblocks %d", ErrCorrupt, len(p.meta.Refcount), p.nblocks)
 	}
 	return p, nil
