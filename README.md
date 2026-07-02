@@ -1,5 +1,9 @@
 # pool
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-volumes/pool.svg)](https://pkg.go.dev/github.com/go-volumes/pool)
+[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+[![CI](https://github.com/go-volumes/pool/actions/workflows/ci.yml/badge.svg)](https://github.com/go-volumes/pool/actions/workflows/ci.yml)
+
 A pure-Go, copy-on-write **pooled volume manager** — a small, ZFS-inspired
 alternative to LVM thin provisioning. No cgo, no root, no device-mapper.
 
